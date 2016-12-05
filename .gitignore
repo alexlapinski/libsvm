@@ -1,0 +1,5 @@
+.DS_Store
+svm-train
+svm-scale
+svm-predict
+svm.o
