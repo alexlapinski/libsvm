@@ -368,7 +368,7 @@ double Kernel::k_function(const svm_node *x, const svm_node *y,
 		case PRECOMPUTED:  //x: test (validation), y: SV
 			return x[(int)(y->value)].value;
 		default:
-			return 0;  // Unreachable 
+			return 0;  // Unreachable
 	}
 }
 
@@ -874,7 +874,7 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		}
 	}
 
-	if(Gmax+Gmax2 < eps || Gmin_idx == -1)
+	if(Gmax+Gmax2 < eps)
 		return 1;
 
 	out_i = Gmax_idx;
@@ -939,7 +939,7 @@ void Solver::do_shrinking()
 		}
 	}
 
-	if(unshrink == false && Gmax1 + Gmax2 <= eps*10) 
+	if(unshrink == false && Gmax1 + Gmax2 <= eps*10)
 	{
 		unshrink = true;
 		reconstruct_gradient();
@@ -1126,7 +1126,7 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 		}
 	}
 
-	if(max(Gmaxp+Gmaxp2,Gmaxn+Gmaxn2) < eps || Gmin_idx == -1)
+	if(max(Gmaxp+Gmaxp2,Gmaxn+Gmaxn2) < eps)
 		return 1;
 
 	if (y[Gmin_idx] == +1)
@@ -1264,7 +1264,7 @@ double Solver_NU::calculate_rho()
 // Q matrices for various formulations
 //
 class SVC_Q: public Kernel
-{ 
+{
 public:
 	SVC_Q(const svm_problem& prob, const svm_parameter& param, const schar *y_)
 	:Kernel(prob.l, prob.x, param)
@@ -1359,8 +1359,57 @@ private:
 	double *QD;
 };
 
+class R2_Qq: public Kernel
+{
+public:
+	R2_Qq(const svm_problem& prob, const svm_parameter& param)
+	:Kernel(prob.l, prob.x, param)
+	{
+		cache = new Cache(prob.l,(int)(param.cache_size*(1<<20)));
+		this->C = param.C;
+		QD = new double[prob.l];
+		for(int i=0;i<prob.l;i++)
+			QD[i]= (Qfloat)(this->*kernel_function)(i,i) + 1/C;
+	}
+	
+	Qfloat *get_Q(int i, int len) const
+	{
+		Qfloat *data;
+		int start;
+		if((start = cache->get_data(i,&data,len)) < len)
+		{
+			for(int j=start;j<len;j++)
+				data[j] = (Qfloat)(this->*kernel_function)(i,j);
+			if(i >= start && i < len)
+				data[i] += 1/C;
+		}
+		return data;
+	}
+	
+	double *get_QD() const
+	{
+		return QD;
+	}
+
+	void swap_index(int i, int j) const
+	{
+		cache->swap_index(i,j);
+		Kernel::swap_index(i,j);
+		swap(QD[i],QD[j]);
+	}
+
+	~R2_Qq()
+	{
+		delete cache;
+	}
+private:
+	Cache *cache;
+	double C;
+	double *QD;
+};
+
 class SVR_Q: public Kernel
-{ 
+{
 public:
 	SVR_Q(const svm_problem& prob, const svm_parameter& param)
 	:Kernel(prob.l, prob.x, param)
@@ -1635,6 +1684,115 @@ static void solve_nu_svr(
 	delete[] y;
 }
 
+static void solve_svdd(
+	const svm_problem *prob, const svm_parameter *param,
+	double *alpha, Solver::SolutionInfo* si) 
+{
+	int l = prob->l;
+	int i,j;
+	double r_square;
+	double C = param->C;
+	double *QD = new double[l];
+	double *linear_term = new double[l];
+	schar *ones = new schar[l];
+
+	ONE_CLASS_Q Q = ONE_CLASS_Q(*prob, *param); 
+	for(i=0;i<l;i++)
+	{
+		QD[i] = Q.get_QD()[i];
+		linear_term[i] = -0.5 * Q.get_QD()[i];
+	}
+
+	if(C > (double)1/l)
+	{
+		double sum_alpha = 1;
+		for(i=0;i<l;i++)
+		{
+			alpha[i] = min(C,sum_alpha);
+			sum_alpha -= alpha[i];
+
+			ones[i] = 1;
+		}
+
+		Solver s;
+		s.Solve(l, Q, linear_term, ones, alpha, C, C,
+			param->eps, si, param->shrinking);
+		
+		// \bar{R} = 2(obj-rho) + sum K_{ii}*alpha_i
+		// because rho = (a^Ta - \bar{R})/2
+		r_square = 2*(si->obj-si->rho);
+		for(i=0;i<l;i++)
+			r_square += alpha[i]*QD[i];
+	}
+	else
+	{
+		r_square = 0.0;
+		double rho = 0;
+		double obj = 0;
+
+		// rho = aTa/2 = sum sum Q_ij /l/l/2
+		// obj = 0.5*(-sum Q_ii + sum sum Q_ij /l)*C
+		// 0.5 for consistency with C > 1/l, where dual is divided by 2
+		for(i=0;i<l;i++)
+		{		
+			obj -= QD[i]/2;
+			rho += QD[i]/2;
+			for(j=i+1;j<l;j++)
+				rho += Kernel::k_function(prob->x[i],prob->x[j],*param);
+		}
+		si->obj = (obj + rho/l)*C;
+		si->rho = rho / (l*l);
+	}	
+
+	info("R^2 = %f\n",r_square);
+	if(C > 1 && param->svm_type == SVDD)
+		info("Warning: Note that after C > 1, all models are the same.\n");	
+	
+	delete[] linear_term;
+	delete[] QD;
+	delete[] ones;
+}
+
+static void solve_r2(
+		const svm_problem *prob, const svm_parameter *param,
+		double *alpha, Solver::SolutionInfo* si)
+{
+	svm_parameter svdd_param = *param;	
+	svdd_param.C = 2;
+	
+	solve_svdd(prob,&svdd_param,alpha,si);
+}
+
+static void solve_r2q(
+		const svm_problem *prob, const svm_parameter *param,
+		double *alpha, Solver::SolutionInfo* si)
+{
+	int l = prob->l;
+	double *linear_term = new double[l];
+	schar *ones = new schar[l];
+	int i;
+
+	alpha[0] = 1;
+	for(i=1;i<l;i++)
+		alpha[i] = 0;
+
+	for(i=0;i<l;i++)
+	{
+		linear_term[i]=-0.5*(Kernel::k_function(prob->x[i],prob->x[i],*param) + 1.0/param->C);
+		ones[i] = 1;
+	}
+
+	Solver s;
+	s.Solve(l, R2_Qq(*prob,*param), linear_term, ones,
+			alpha, INF, INF, param->eps, si, param->shrinking);
+
+	info("R^2 = %f\n", -2 *si->obj);
+
+	delete[] linear_term;
+	delete[] ones;
+}
+
+
 //
 // decision_function
 //
@@ -1667,6 +1825,16 @@ static decision_function svm_train_one(
 		case NU_SVR:
 			solve_nu_svr(prob,param,alpha,&si);
 			break;
+		case SVDD:
+			solve_svdd(prob,param,alpha,&si);
+			break;
+		case R2:
+			solve_r2(prob,param,alpha,&si);
+			break;
+		case R2q:
+			solve_r2q(prob,param,alpha,&si);
+			break;
+
 	}
 
 	info("obj = %f, rho = %f\n",si.obj,si.rho);
@@ -1703,7 +1871,7 @@ static decision_function svm_train_one(
 
 // Platt's binary SVM Probablistic Output: an improvement from Lin et al.
 static void sigmoid_train(
-	int l, const double *dec_values, const double *labels, 
+	int l, const double *dec_values, const double *labels,
 	double& A, double& B)
 {
 	double prior1=0, prior0 = 0;
@@ -1998,9 +2166,9 @@ static double svm_svr_probability(
 	int count=0;
 	mae=0;
 	for(i=0;i<prob->l;i++)
-		if (fabs(ymv[i]) > 5*std) 
+		if (fabs(ymv[i]) > 5*std)
 			count=count+1;
-		else 
+		else
 			mae+=fabs(ymv[i]);
 	mae /= (prob->l-count);
 	info("Prob. model for test data: target value = predicted value + z,\nz: Laplace distribution e^(-|z|/sigma)/(2sigma),sigma= %g\n",mae);
@@ -2049,8 +2217,8 @@ static void svm_group_classes(const svm_problem *prob, int *nr_class_ret, int **
 	}
 
 	//
-	// Labels are ordered by their first occurrence in the training set. 
-	// However, for two-class sets with -1/+1 labels and -1 appears first, 
+	// Labels are ordered by their first occurrence in the training set.
+	// However, for two-class sets with -1/+1 labels and -1 appears first,
 	// we swap labels to ensure that internally the binary SVM has positive data corresponding to the +1 instances.
 	//
 	if (nr_class == 2 && label[0] == -1 && label[1] == 1)
@@ -2097,7 +2265,10 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 
 	if(param->svm_type == ONE_CLASS ||
 	   param->svm_type == EPSILON_SVR ||
-	   param->svm_type == NU_SVR)
+	   param->svm_type == NU_SVR ||
+	   param->svm_type == SVDD ||
+	   param->svm_type == R2 ||
+	   param->svm_type == R2q)
 	{
 		// regression or one-class-svm
 		model->nr_class = 2;
@@ -2106,7 +2277,7 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 		model->probA = NULL; model->probB = NULL;
 		model->sv_coef = Malloc(double *,1);
 
-		if(param->probability && 
+		if(param->probability &&
 		   (param->svm_type == EPSILON_SVR ||
 		    param->svm_type == NU_SVR))
 		{
@@ -2150,7 +2321,7 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 
 		// group training data of the same class
 		svm_group_classes(prob,&nr_class,&label,&start,&count,perm);
-		if(nr_class == 1) 
+		if(nr_class == 1)
 			info("WARNING: training data in only one class. See README for details.\n");
 		
 		svm_node **x = Malloc(svm_node *,l);
@@ -2365,7 +2536,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 		int *index = Malloc(int,l);
 		for(i=0;i<l;i++)
 			index[i]=perm[i];
-		for (c=0; c<nr_class; c++) 
+		for (c=0; c<nr_class; c++)
 			for(i=0;i<count[c];i++)
 			{
 				int j = i+rand()%(count[c]-i);
@@ -2437,7 +2608,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 			++k;
 		}
 		struct svm_model *submodel = svm_train(&subprob,param);
-		if(param->probability && 
+		if(param->probability &&
 		   (param->svm_type == C_SVC || param->svm_type == NU_SVC))
 		{
 			double *prob_estimates=Malloc(double,svm_get_nr_class(submodel));
@@ -2517,6 +2688,18 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 		else
 			return sum;
 	}
+	else if (model->param.svm_type == SVDD)
+	{
+		// Compute distance from center of hypersphere
+		// rho = (a^Ta - \bar{R})/2
+		double *sv_coef = model->sv_coef[0];
+		double tmp_value = Kernel::k_function(x,x,model->param); // x^T x - 2 x^T a
+		for(int i=0;i<model->l;i++)
+			tmp_value -= 2 * sv_coef[i] * Kernel::k_function(x,model->SV[i],model->param);
+		
+		*dec_values = tmp_value + 2*model->rho[0];
+		return (*dec_values<=0?1:-1);
+	}
 	else
 	{
 		int nr_class = model->nr_class;
@@ -2580,9 +2763,10 @@ double svm_predict(const svm_model *model, const svm_node *x)
 	double *dec_values;
 	if(model->param.svm_type == ONE_CLASS ||
 	   model->param.svm_type == EPSILON_SVR ||
-	   model->param.svm_type == NU_SVR)
+	   model->param.svm_type == NU_SVR ||
+	   model->param.svm_type == SVDD)
 		dec_values = Malloc(double, 1);
-	else 
+	else
 		dec_values = Malloc(double, nr_class*(nr_class-1)/2);
 	double pred_result = svm_predict_values(model, x, dec_values);
 	free(dec_values);
@@ -2624,13 +2808,13 @@ double svm_predict_probability(
 		free(pairwise_prob);
 		return model->label[prob_max_idx];
 	}
-	else 
+	else
 		return svm_predict(model, x);
 }
 
 static const char *svm_type_table[] =
 {
-	"c_svc","nu_svc","one_class","epsilon_svr","nu_svr",NULL
+	"c_svc","nu_svc","one_class","epsilon_svr","nu_svr","svdd","r2","r2q",NULL
 };
 
 static const char *kernel_type_table[]=
@@ -2643,10 +2827,7 @@ int svm_save_model(const char *model_file_name, const svm_model *model)
 	FILE *fp = fopen(model_file_name,"w");
 	if(fp==NULL) return -1;
 
-	char *old_locale = setlocale(LC_ALL, NULL);
-	if (old_locale) {
-		old_locale = strdup(old_locale);
-	}
+	char *old_locale = strdup(setlocale(LC_ALL, NULL));
 	setlocale(LC_ALL, "C");
 
 	const svm_parameter& param = model->param;
@@ -2878,10 +3059,7 @@ svm_model *svm_load_model(const char *model_file_name)
 	FILE *fp = fopen(model_file_name,"rb");
 	if(fp==NULL) return NULL;
 
-	char *old_locale = setlocale(LC_ALL, NULL);
-	if (old_locale) {
-		old_locale = strdup(old_locale);
-	}
+	char *old_locale = strdup(setlocale(LC_ALL, NULL));
 	setlocale(LC_ALL, "C");
 
 	// read parameters
@@ -3041,7 +3219,10 @@ const char *svm_check_parameter(const svm_problem *prob, const svm_parameter *pa
 	   svm_type != NU_SVC &&
 	   svm_type != ONE_CLASS &&
 	   svm_type != EPSILON_SVR &&
-	   svm_type != NU_SVR)
+	   svm_type != NU_SVR &&
+	   svm_type != SVDD &&
+	   svm_type != R2 &&
+	   svm_type != R2q)
 		return "unknown svm type";
 	
 	// kernel_type, degree
@@ -3070,9 +3251,11 @@ const char *svm_check_parameter(const svm_problem *prob, const svm_parameter *pa
 
 	if(svm_type == C_SVC ||
 	   svm_type == EPSILON_SVR ||
-	   svm_type == NU_SVR)
-		if(param->C <= 0)
-			return "C <= 0";
+	   svm_type == NU_SVR ||
+	   svm_type == SVDD ||
+	   svm_type == R2q)
+		if(param->C < 0)
+			return "C < 0";
 
 	if(svm_type == NU_SVC ||
 	   svm_type == ONE_CLASS ||
@@ -3093,7 +3276,7 @@ const char *svm_check_parameter(const svm_problem *prob, const svm_parameter *pa
 		return "probability != 0 and probability != 1";
 
 	if(param->probability == 1 &&
-	   svm_type == ONE_CLASS)
+	   (svm_type == ONE_CLASS || svm_type == SVDD))
 		return "one-class SVM probability output not supported yet";
 
 

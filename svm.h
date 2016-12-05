@@ -1,7 +1,7 @@
 #ifndef _LIBSVM_H
 #define _LIBSVM_H
 
-#define LIBSVM_VERSION 321
+#define LIBSVM_VERSION 318
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,7 +22,7 @@ struct svm_problem
 	struct svm_node **x;
 };
 
-enum { C_SVC, NU_SVC, ONE_CLASS, EPSILON_SVR, NU_SVR };	/* svm_type */
+enum { C_SVC, NU_SVC, ONE_CLASS, EPSILON_SVR, NU_SVR, SVDD, R2, R2q };	/* svm_type */
 enum { LINEAR, POLY, RBF, SIGMOID, PRECOMPUTED }; /* kernel_type */
 
 struct svm_parameter
@@ -48,7 +48,7 @@ struct svm_parameter
 
 //
 // svm_model
-// 
+//
 struct svm_model
 {
 	struct svm_parameter param;	/* parameter */
